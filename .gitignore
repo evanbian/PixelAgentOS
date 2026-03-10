@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+backend/.venv/
+backend/.venv_new/
+backend/.env
+
+# Claude/Agent skill configs (local-only)
+.agent/
+.agents/
+.claude/
+backend/.agent/
+backend/.agents/
+backend/.claude/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data
+backend/workspaces/
+backend/agent_homes/
+backend/outputs/
+backend/*.db
+backend/*.log
+
+# Asset generator (contains API key)
+frontend/public/gen.html
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

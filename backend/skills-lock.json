@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "spritecook-generate-sprites": {
+      "source": "spritecook/skills",
+      "sourceType": "github",
+      "computedHash": "d4826b659dfcf2abbe4b21ab0f783463ce4ce985df44b4f01e5c175f18247dde"
+    }
+  }
+}
