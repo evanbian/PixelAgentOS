@@ -28,6 +28,9 @@ backend/*.log
 # Asset generator (contains API key)
 frontend/public/gen.html
 
+# Raw AI-generated sprite originals (large files, not used at runtime)
+frontend/public/assets/sprites/generated/
+
 # OS files
 .DS_Store
 Thumbs.db
