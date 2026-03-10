@@ -40,3 +40,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Large font files (add separately via git lfs or manual upload)
+frontend/public/assets/fonts/*.woff2
