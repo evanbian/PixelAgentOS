@@ -1,4 +1,5 @@
 # 🎮 PixelAgentOS
+<img width="3024" height="1706" alt="image" src="https://github.com/user-attachments/assets/bacf4e20-cd42-4696-ae0d-849192a4956a" />
 
 A pixel-art multi-agent collaboration platform. Play as a founder, hire AI agents, assign tasks, and watch them work in your virtual pixel office.
 
