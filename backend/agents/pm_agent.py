@@ -541,15 +541,6 @@ WORKSPACE FILES below for the actual file listings.
 === END FILES ===
 """
 
-        # Extract acceptance criteria from description if present
-        acceptance_hint = ""
-        desc_lower = subtask.description.lower()
-        if "acceptance criteria:" in desc_lower or "验收标准:" in subtask.description:
-            acceptance_hint = """
-IMPORTANT: The subtask description contains explicit "Acceptance criteria".
-You MUST check each criterion. Only approve if ALL criteria are met.
-If any criterion is not met, set approved=false and specify WHICH criteria failed."""
-
         prompt = f"""You are a PM reviewing a subtask result.
 
 Main task: {task.title}
@@ -559,18 +550,24 @@ Description: {subtask.description}
 Agent's text reply:
 {result[:2000]}
 {extra_context}
-{acceptance_hint}
 
-REVIEW RULES:
-1. Check ACCEPTANCE CRITERIA from the description first (if present). Each must be met.
-2. Check deliverables: Did the agent produce the requested output? Look at BOTH the text reply AND the scratchpad/workspace data above.
-3. Scratchpad entries are STRUCTURED METADATA (JSON file references or key metrics), not full document content. A file reference entry means the agent successfully wrote a file — this counts as a valid deliverable.
-4. An agent who writes files (visible in workspace) and structured data to scratchpad but gives a short text reply is STILL acceptable — judge by actual output, not reply length.
-5. Only reject for genuine quality issues, not style preferences.
+REVIEW with THREE-TIER severity:
 
-LANGUAGE RULE: Your feedback MUST be in the same language as the task title: "{task.title}".
+"pass" — Core deliverable is correct and all major requirements met. Minor imperfections are OK.
+"minor" — Deliverable exists and is mostly correct, but has small fixable issues (formatting, length slightly off, missing a detail). Agent can fix in 1-2 tool calls.
+"fail" — Deliverable is missing, fundamentally wrong, or missing critical requirements.
 
-Reply JSON only: {{"approved": true/false, "feedback": "brief reason"}}"""
+REVIEW GUIDELINES:
+1. Focus on SUBSTANCE over FORM. Did the agent produce what was asked? Is the core content correct?
+2. Numeric thresholds in acceptance criteria (word count, source count) have ±30% tolerance. E.g. "100-200 words" accepts 70-260 words.
+3. Scratchpad file references (type="file_deliverable") mean the agent wrote a file — this IS a valid deliverable.
+4. Short text replies with workspace files + scratchpad data = ACCEPTABLE. Judge by actual output.
+5. Style preferences (formatting, exact phrasing) are NEVER grounds for "fail".
+6. When in doubt, choose "pass" or "minor" — NOT "fail". Rework is expensive.
+
+LANGUAGE RULE: feedback MUST be in the same language as the task title: "{task.title}".
+
+Reply JSON only: {{"severity": "pass"|"minor"|"fail", "feedback": "brief reason"}}"""
 
         try:
             logger.info(
@@ -579,15 +576,28 @@ Reply JSON only: {{"approved": true/false, "feedback": "brief reason"}}"""
             )
             content = await self._call_llm(prompt, max_tokens=300)
             match = re.search(r'\{[\s\S]*\}', content)
-            verdict = json.loads(match.group()) if match else {"approved": True, "feedback": ""}
+            verdict = json.loads(match.group()) if match else {"severity": "pass", "feedback": ""}
+
+            # Normalize three-tier severity to approved + severity
+            severity = verdict.get("severity", "pass").lower().strip()
+            if severity not in ("pass", "minor", "fail"):
+                # Fallback: legacy approved field
+                if verdict.get("approved") is False:
+                    severity = "fail"
+                else:
+                    severity = "pass"
+
+            verdict["severity"] = severity
+            verdict["approved"] = severity != "fail"
+
             logger.info(
-                f"[PM] Review verdict: approved={verdict.get('approved')}, "
+                f"[PM] Review verdict: severity={severity}, "
                 f"feedback='{verdict.get('feedback', '')[:100]}'"
             )
             return verdict
         except Exception as e:
             logger.warning(f"[PM] Review parse failed: {e}, auto-approving")
-            return {"approved": True, "feedback": "Auto-approved (review parse error)"}
+            return {"approved": True, "severity": "pass", "feedback": "Auto-approved (review parse error)"}
 
     # ─── evaluate synthesis need + pick agent (merged, 1 LLM call) ───
     async def evaluate_and_pick_synthesis(

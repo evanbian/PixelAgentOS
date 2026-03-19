@@ -84,6 +84,45 @@ def _scan_workspace_recursive(workspace_dir: str) -> list:
     return sorted(results)
 
 
+def _clean_final_output(text: str, ws_url: str = "") -> str:
+    """Sanitize final deliverable before showing to user.
+
+    Removes:
+      - DeepSeek DSML tags (<｜DSML｜...>)
+      - Raw "Generated Files:" blocks with internal workspace paths
+      - Trailing agent meta-commentary (after the last markdown HR)
+    """
+    import re as _r
+
+    # 1. Strip DSML tags (DeepSeek artifacts)
+    text = _r.sub(r'<[/｜|]*\s*DSML\s*[｜|]*[^>]*>', '', text)
+    # Also strip incomplete DSML-style tags: </| ... > patterns
+    text = _r.sub(r'</?[｜|][^>]{0,50}>', '', text)
+
+    # 2. Remove "Generated Files:" / "**Generated Files:**" blocks
+    #    These contain raw workspace paths with UUIDs — not useful to users.
+    #    Pattern: starts with "Generated Files" line, continues with indented
+    #    bullet lines containing /api/workspaces/ paths
+    text = _r.sub(
+        r'\n*-{2,3}\n\*?\*?Generated Files:?\*?\*?\n[\s\S]*$',
+        '', text
+    )
+
+    # 3. Remove any stray lines that are just workspace URL paths
+    if ws_url:
+        lines = text.split('\n')
+        cleaned_lines = [
+            ln for ln in lines
+            if ws_url not in ln or not ln.strip().startswith('-')
+        ]
+        text = '\n'.join(cleaned_lines)
+
+    # 4. Trim trailing whitespace / blank lines
+    text = text.rstrip()
+
+    return text
+
+
 async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
     """
     6-phase orchestration:
@@ -317,10 +356,10 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                         + f"\nYour subtask: {st.title}\n"
                         f"Details: {st.description}\n\n"
                         f"PROTOCOL:\n"
-                        f"1. read_scratchpad('') → get upstream data and file references.\n"
-                        f"2. If scratchpad lists files with paths → read_file(path) to get full content.\n"
-                        f"3. Do your work. write_document for deliverables (auto-shared as file ref).\n"
-                        f"4. write_scratchpad for key metrics/findings not in your documents.\n"
+                        f"1. read_scratchpad('') → see file index (sections, keywords, data points).\n"
+                        f"2. grep_workspace(\"keyword\") or read_file_lines(path, start, end) for targeted retrieval.\n"
+                        f"3. Do your work. write_document for deliverables (auto-indexed to scratchpad).\n"
+                        f"4. write_scratchpad for key metrics as {{\"type\":\"data_export\",...}}.\n"
                         f"5. Respond in the same language as the task title."
                         + budget_hint
                         + teammates_info
@@ -342,8 +381,6 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                 _sp_prefixes = [f"draft:{st.id}:"]
                 for dep_st_id in (st.read_from or []):
                     _sp_prefixes.append(f"draft:{dep_st_id}:")
-                # Also include file: entries (auto-synced from write_document)
-                _sp_prefixes.append("file:")
                 _sp_entries_for_review = scratchpad.read_filtered(_sp_prefixes)
 
                 _ws_files_for_review = ""
@@ -383,13 +420,44 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                     f"feedback='{review.get('feedback', '')[:100]}'"
                 )
                 approved = True
-                if not review.get("approved", True):
+                review_severity = review.get("severity", "pass")
+
+                # Three-tier review handling:
+                #   "pass"  → approved, no rework
+                #   "minor" → approved, lightweight rework (2 iterations)
+                #   "fail"  → not approved, full rework (4 iterations)
+                if review_severity == "minor":
+                    # Minor issues: quick fix, still counts as approved
+                    await ws_manager.emit_pm_message(
+                        f"Minor issues in '{st.title}': {review.get('feedback', '')}. Quick fix..."
+                    )
+                    task_metrics.rework_count += 1
+                    rework_feedback = (
+                        f"⚠️ PM MINOR FEEDBACK — small fix needed:\n"
+                        f"{review.get('feedback', '')}\n\n"
+                        f"Make ONLY the specific fix mentioned above. "
+                        f"Do NOT redo your entire work. 1-2 tool calls max.\n"
+                        f"IMPORTANT: Respond in the same language as the task title: {task.title}"
+                    )
+                    result, _, _, st_messages = await execute_worker_task(
+                        agent=agent,
+                        task_description=rework_feedback,
+                        subtask_id=st.id,
+                        on_status_change=on_status,
+                        on_message=on_msg,
+                        on_stream_chunk=on_stream,
+                        extra_tools=sp_tools,
+                        _resume_messages=st_messages,
+                        _resume_max_iter=2,
+                    )
+                    await ws_manager.emit_subtask_stream_end(task.id, st.id)
+                    # Minor rework is always accepted (no re-review)
+
+                elif review_severity == "fail":
                     await ws_manager.emit_pm_message(
                         f"Review failed for '{st.title}': {review.get('feedback', '')}. Requesting rework..."
                     )
                     task_metrics.rework_count += 1
-                    # Rework: CONTINUE from previous context (not restart)
-                    # Inject PM feedback into existing message history
                     rework_feedback = (
                         f"⚠️ PM REVIEW FEEDBACK — please fix the following:\n"
                         f"{review.get('feedback', '')}\n\n"
@@ -407,11 +475,11 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                         on_stream_chunk=on_stream,
                         extra_tools=sp_tools,
                         _resume_messages=st_messages,
-                        _resume_max_iter=5,
+                        _resume_max_iter=4,
                     )
                     await ws_manager.emit_subtask_stream_end(task.id, st.id)
 
-                    # Re-gather scratchpad after rework (agent may have updated it)
+                    # Re-gather scratchpad after rework
                     _sp_entries_for_review = scratchpad.read_filtered(
                         [f"draft:{st.id}:"]
                     )
@@ -421,13 +489,13 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                     except OSError:
                         _ws_files_for_review = ""
 
-                    # Second review
+                    # Second review after fail-rework
                     review2 = await pm.review(
                         st, result, task,
                         scratchpad_content=_sp_entries_for_review,
                         workspace_files=_ws_files_for_review,
                     )
-                    if not review2.get("approved", True):
+                    if review2.get("severity", "pass") == "fail":
                         approved = False
 
                 # Aggregate subtask metrics
@@ -489,6 +557,10 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                     else:
                         _, result_str, approved = batch_result
 
+                    # Register result BEFORE replan so replanned subtasks
+                    # get read_from access to this subtask's scratchpad data
+                    subtask_results[st.id] = result_str
+
                     # Handle replan on failure
                     if not approved and not replan_used:
                         replan_used = True
@@ -527,7 +599,6 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                         except Exception as e:
                             logger.error(f"[Graph] Replan failed: {e}")
 
-                    subtask_results[st.id] = result_str
                     st.status = "done"
                     st.output = result_str
                     completed_ids.add(st.id)
@@ -563,12 +634,46 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                         for relpath in ws_files
                     )
 
-            # ── PM evaluates synthesis need + picks agent (1 LLM call) ──
-            eval_result = await pm.evaluate_and_pick_synthesis(
-                task, agents, subtask_results,
-                workspace_files=ws_files_text,
-                scratchpad_content=sp_content,
-            )
+            # ── Heuristic pre-check: skip synthesis without LLM call ──
+            # If the last subtask already produced a deliverable file that
+            # covers upstream data, synthesis is redundant.
+            _heuristic_skip = False
+            _heuristic_st_id = None
+            _last_st = subtasks[-1] if subtasks else None
+            if _last_st and _last_st.id in subtask_results:
+                _last_agent_id = _last_st.assigned_to or ""
+                _last_ws = os.path.join(workspace_dir, _last_agent_id, _last_st.id)
+                _last_file = _read_best_workspace_file(_last_ws)
+                if _last_file and len(_last_file) > 500:
+                    # Check if it references content from upstream subtasks
+                    _upstream_titles = [s.title for s in subtasks[:-1]]
+                    _ref_hits = sum(
+                        1 for t in _upstream_titles
+                        if t[:8].lower() in _last_file.lower()
+                    )
+                    if _ref_hits >= max(1, len(_upstream_titles) * 0.3):
+                        _heuristic_skip = True
+                        _heuristic_st_id = _last_st.id
+                        logger.info(
+                            f"[Graph] Synthesis heuristic SKIP: last subtask "
+                            f"'{_last_st.title}' has {len(_last_file)} char file "
+                            f"referencing {_ref_hits}/{len(_upstream_titles)} upstream topics"
+                        )
+
+            if _heuristic_skip:
+                eval_result = {
+                    "needed": False,
+                    "reason": "Last subtask already produced integrated deliverable (heuristic)",
+                    "final_subtask_id": _heuristic_st_id,
+                }
+            else:
+                # ── PM evaluates synthesis need + picks agent (1 LLM call) ──
+                eval_result = await pm.evaluate_and_pick_synthesis(
+                    task, agents, subtask_results,
+                    workspace_files=ws_files_text,
+                    scratchpad_content=sp_content,
+                )
+
             synthesis_needed = eval_result.get("needed", True)
             skip_reason = eval_result.get("reason", "")
             final_st_id = eval_result.get("final_subtask_id")
@@ -839,15 +944,14 @@ async def run_task_graph(task: Task, agents: list[Agent], ws_manager) -> str:
                     f"[Graph] Acceptance: status={verdict.get('status')}, "
                     f"score={quality_score}"
                 )
-                # Append workspace file list if not already in synthesis
-                if ws_files_text and ws_url not in synthesis_result:
-                    final_output += f"\n\n---\n**Generated Files:**\n{ws_files_text}"
                 if issues:
                     note = "; ".join(issues)
                     logger.info(f"[Graph] Acceptance issues: {note}")
             except Exception as e:
                 logger.warning(f"[Graph] Acceptance JSON parse failed: {e}")
 
+            # ── Clean final output before delivery ──
+            final_output = _clean_final_output(final_output, ws_url)
             logger.info(f"[Graph] Final output: {len(final_output)} chars")
 
             await ws_manager.emit_task_update(task.id, "in_progress", 95)

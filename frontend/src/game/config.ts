@@ -33,8 +33,8 @@ export const SPRITE_CONFIG = {
   FRAME_HEIGHT: 64,
   COLS: 4,
   ROWS: 1,
-  DISPLAY_SCALE: 1.5,   // 64 * 1.3 ≈ 83px — proportional to workstation furniture
-  PM_DISPLAY_SCALE: 0.9, // PM portrait at native 64px (front-facing, inherently larger feel)
+  DISPLAY_SCALE: 1.5,   // 64 * 1.5 ≈ 96px — proportional to workstation furniture
+  PM_DISPLAY_SCALE: 1.1, // PM boss — slightly larger than employees to fill the executive chair
 };
 
 export const STATUS_FRAME_INDEX: Record<string, number> = {
@@ -82,6 +82,7 @@ export function getTextureKeyForRole(role: string): string {
   return DEFAULT_SPRITE_KEY;
 }
 
+
 // ── Debug mode: show hit zone boundaries ─────────────────────────────────────
 export const DEBUG_HIT_ZONES = false;
 
@@ -93,18 +94,18 @@ export const DEBUG_HIT_ZONES = false;
 // Y coordinates are calibrated to chair centers (BELOW desk surface, not ON it).
 // X positions match actual desk column centers in the background image.
 export const WORKSTATION_POSITIONS = [
-  // Row 1 (top desks — positions verified interactively in-browser)
-  { id: 'ws_0',  x: 178,  y: 172,  hitW: 90, hitH: 70 },
-  { id: 'ws_1',  x: 352,  y: 172,  hitW: 90, hitH: 70 },
+  // Row 1 (top desks — re-calibrated for new Kairosoft sprites)
+  { id: 'ws_0',  x: 190,  y: 172,  hitW: 90, hitH: 70 },
+  { id: 'ws_1',  x: 325,  y: 172,  hitW: 90, hitH: 70 },
   { id: 'ws_2',  x: 448,  y: 172,  hitW: 90, hitH: 70 },
   // Row 2 (middle desks)
-  { id: 'ws_3',  x: 110,  y: 302,  hitW: 90, hitH: 70 },
+  { id: 'ws_3',  x: 128,  y: 302,  hitW: 90, hitH: 70 },
   { id: 'ws_4',  x: 292,  y: 302,  hitW: 90, hitH: 70 },
-  { id: 'ws_5',  x: 474,  y: 302,  hitW: 90, hitH: 70 },
+  { id: 'ws_5',  x: 458,  y: 302,  hitW: 90, hitH: 70 },
   // Row 3 (bottom desks)
-  { id: 'ws_6',  x: 110,  y: 432,  hitW: 90, hitH: 70 },
+  { id: 'ws_6',  x: 128,  y: 432,  hitW: 90, hitH: 70 },
   { id: 'ws_7',  x: 292,  y: 432,  hitW: 90, hitH: 70 },
-  { id: 'ws_8',  x: 474,  y: 432,  hitW: 90, hitH: 70 },
+  { id: 'ws_8',  x: 458,  y: 432,  hitW: 90, hitH: 70 },
 ];
 
 // ── PM desk position (boss chair, right side) ───────────────────────────────

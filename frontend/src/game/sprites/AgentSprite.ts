@@ -17,8 +17,8 @@ const BUBBLE_COLORS: Record<string, number> = {
   thinking:      0xf57f17,
   communicating: 0x1565c0,
 };
-const BUBBLE_R = 12;            // bubble circle radius (game px)
-const ICON_SCALE = 18 / 72;    // twemoji is 72×72, display at 18px
+const BUBBLE_R = 14;            // bubble circle radius (game px)
+const ICON_SCALE = 1;           // pixel art icons are 24×24, display at native size
 
 export class AgentSprite extends Phaser.GameObjects.Container {
   private character!: Phaser.GameObjects.Sprite;

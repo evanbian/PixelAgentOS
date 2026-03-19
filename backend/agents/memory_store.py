@@ -4,6 +4,9 @@ Three-layer memory architecture:
   Hot  — profile.json + recent task_history (always injected)
   Warm — ChromaDB semantic search top-K (per-task RAG)
   Cold — full ChromaDB collection (explicit recall only)
+
+Search is hybrid: vector (ChromaDB) + keyword (SQLite FTS5) fused via
+RRF-style weighted merge, temporal decay, and MMR diversity re-ranking.
 """
 from __future__ import annotations
 
@@ -14,8 +17,9 @@ import os
 import urllib.request
 import urllib.error
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
+import aiosqlite
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Embeddings, Documents
 
@@ -87,9 +91,37 @@ def get_agent_collection(agent_id: str) -> chromadb.Collection:
 # ── CRUD (async wrappers around sync ChromaDB) ──────────────────────────────
 
 async def save_memory_to_store(entry: MemoryEntry) -> None:
-    """Persist a MemoryEntry into the agent's ChromaDB collection."""
+    """Persist a MemoryEntry into the agent's ChromaDB collection.
+
+    Deduplication: if an existing memory has cosine distance < 0.08
+    (very similar content), skip insertion to avoid redundant entries.
+    """
     def _save():
         col = get_agent_collection(entry.agent_id)
+
+        # Near-duplicate check before inserting
+        if col.count() > 0:
+            try:
+                existing = col.query(
+                    query_texts=[entry.content],
+                    n_results=1,
+                    where={"agent_id": entry.agent_id},
+                    include=["distances"],
+                )
+                if (
+                    existing
+                    and existing.get("distances")
+                    and existing["distances"][0]
+                    and existing["distances"][0][0] < 0.08
+                ):
+                    logger.info(
+                        f"[MemoryStore] Skipping near-duplicate memory for "
+                        f"{entry.agent_id} (distance={existing['distances'][0][0]:.4f})"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"[MemoryStore] Dedup check failed, proceeding with save: {e}")
+
         col.add(
             ids=[entry.id],
             documents=[entry.content],
@@ -100,7 +132,61 @@ async def save_memory_to_store(entry: MemoryEntry) -> None:
                 "created_at": entry.created_at.isoformat(),
             }],
         )
+
     await asyncio.to_thread(_save)
+
+
+async def _fts5_search(
+    agent_id: str,
+    query: str,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Search agent memories using SQLite FTS5 full-text search (trigram tokenizer).
+
+    Returns a list of dicts with keys: id, content, category, importance,
+    timestamp, score.  Falls back to empty list on any error.
+    """
+    from agents.memory_hybrid import build_fts_query, bm25_rank_to_score
+    from database import DB_PATH
+
+    fts_query = build_fts_query(query)
+    if not fts_query:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # FTS5 table only indexes `content`; agent filtering is done via JOIN.
+            # `rank` is the BM25 score exposed by FTS5 (more negative = more relevant).
+            sql = """
+                SELECT m.id,
+                       m.content,
+                       m.category,
+                       m.importance,
+                       m.created_at,
+                       fts.rank
+                FROM agent_memories_fts fts
+                JOIN agent_memories m ON m.rowid = fts.rowid
+                WHERE agent_memories_fts MATCH ?
+                  AND m.agent_id = ?
+                ORDER BY fts.rank
+                LIMIT ?
+            """
+            async with db.execute(sql, (fts_query, agent_id, limit)) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    results.append({
+                        "id": str(row[0]),
+                        "content": row[1],
+                        "category": row[2] or "general",
+                        "importance": float(row[3]) if row[3] is not None else 0.5,
+                        "timestamp": row[4],   # ISO string; hybrid pipeline parses it
+                        "score": bm25_rank_to_score(row[5]),
+                    })
+    except Exception as e:
+        logger.warning(f"[MemoryStore] FTS5 search failed for {agent_id}, skipping: {e}")
+
+    return results
 
 
 async def search_memory_store(
@@ -108,17 +194,26 @@ async def search_memory_store(
     query: str,
     limit: int = 5,
     category: Optional[str] = None,
-) -> list:
-    """Semantic search with recency re-ranking.
+) -> List[MemoryEntry]:
+    """Hybrid memory search: vector (ChromaDB) + keyword (FTS5) with temporal
+    decay and MMR diversity re-ranking.
 
-    final_score = similarity * 0.6 + recency * 0.4
+    Pipeline:
+      1. ChromaDB cosine-similarity search  (weight 0.7)
+      2. SQLite FTS5 BM25 keyword search    (weight 0.3)
+      3. Weighted score merge (RRF-style)
+      4. Temporal decay  (half-life = 30 days)
+      5. MMR re-ranking  (lambda = 0.7 — balanced relevance/diversity)
     """
-    def _search():
+    from agents.memory_hybrid import hybrid_search_pipeline
+
+    # ── 1. Vector search (ChromaDB, synchronous) ──────────────────────────
+    def _vector_search() -> List[Dict[str, Any]]:
         col = get_agent_collection(agent_id)
         if col.count() == 0:
             return []
 
-        where_filter = {"agent_id": agent_id}
+        where_filter: Dict[str, Any] = {"agent_id": agent_id}
         if category:
             where_filter = {"$and": [
                 {"agent_id": agent_id},
@@ -126,49 +221,74 @@ async def search_memory_store(
             ]}
 
         try:
-            results = col.query(
+            raw = col.query(
                 query_texts=[query],
-                n_results=min(limit * 2, col.count()),
+                n_results=min(limit * 3, col.count()),
                 where=where_filter,
                 include=["documents", "metadatas", "distances"],
             )
         except Exception as e:
-            logger.warning(f"ChromaDB query failed: {e}")
+            logger.warning(f"[MemoryStore] ChromaDB query failed: {e}")
             return []
 
-        if not results or not results["ids"] or not results["ids"][0]:
+        if not raw or not raw.get("ids") or not raw["ids"][0]:
             return []
 
-        # Re-rank: combine similarity with recency
-        now = datetime.utcnow()
-        entries = []
-        for i, doc_id in enumerate(results["ids"][0]):
-            meta = results["metadatas"][0][i]
-            distance = results["distances"][0][i]  # cosine distance (0=identical)
-            similarity = 1.0 - distance  # convert to similarity
+        vector_hits: List[Dict[str, Any]] = []
+        for i, doc_id in enumerate(raw["ids"][0]):
+            meta = raw["metadatas"][0][i]
+            distance = raw["distances"][0][i]      # cosine distance (0 = identical)
+            similarity = max(0.0, 1.0 - distance)  # convert to [0, 1] similarity
+            vector_hits.append({
+                "id": str(doc_id),
+                "content": raw["documents"][0][i],
+                "category": meta.get("category", "general"),
+                "importance": float(meta.get("importance", 0.5)),
+                "timestamp": meta.get("created_at"),   # ISO string
+                "score": similarity,
+            })
+        return vector_hits
 
-            try:
-                created = datetime.fromisoformat(meta["created_at"])
-                days_old = max((now - created).total_seconds() / 86400, 0.01)
-            except (ValueError, KeyError):
-                days_old = 30.0
-            recency = 1.0 / (1.0 + days_old)
+    # Run vector search in thread (ChromaDB is sync), FTS5 concurrently
+    vector_results, keyword_results = await asyncio.gather(
+        asyncio.to_thread(_vector_search),
+        _fts5_search(agent_id, query, limit=limit * 3),
+    )
 
-            final_score = similarity * 0.6 + recency * 0.4
+    # ── 2-5. Hybrid pipeline: merge → decay → MMR ────────────────────────
+    merged = hybrid_search_pipeline(
+        vector_results=vector_results,
+        keyword_results=keyword_results,
+        vector_weight=0.7,
+        text_weight=0.3,
+        enable_decay=True,
+        half_life_days=30.0,
+        enable_mmr=True,
+        mmr_lambda=0.7,
+        max_results=limit,
+    )
 
-            entries.append((final_score, MemoryEntry(
-                id=doc_id,
-                agent_id=meta.get("agent_id", agent_id),
-                content=results["documents"][0][i],
-                category=meta.get("category", "general"),
-                importance=float(meta.get("importance", 0.5)),
-                created_at=created if days_old != 30.0 else datetime.utcnow(),
-            )))
+    # ── 6. Convert merged dicts back to MemoryEntry objects ───────────────
+    entries: List[MemoryEntry] = []
+    for hit in merged:
+        ts_raw = hit.get("timestamp")
+        try:
+            created_at = (
+                datetime.fromisoformat(ts_raw) if ts_raw else datetime.utcnow()
+            )
+        except (ValueError, TypeError):
+            created_at = datetime.utcnow()
 
-        entries.sort(key=lambda x: x[0], reverse=True)
-        return [e for _, e in entries[:limit]]
+        entries.append(MemoryEntry(
+            id=hit["id"],
+            agent_id=agent_id,
+            content=hit["content"],
+            category=hit.get("category", "general"),
+            importance=float(hit.get("importance", 0.5)),
+            created_at=created_at,
+        ))
 
-    return await asyncio.to_thread(_search)
+    return entries
 
 
 async def get_recent_from_store(agent_id: str, limit: int = 10) -> list:

@@ -504,6 +504,154 @@ def read_file(filename: str) -> str:
         return f"Error reading file: {str(e)}"
 
 
+@tool
+def grep_workspace(pattern: str, file_hint: str = "") -> str:
+    """Search for a regex pattern across workspace and upstream workspace files.
+
+    Returns matching lines with context (1 line before/after each match).
+    Use this for targeted data retrieval instead of reading entire files.
+
+    Args:
+        pattern: Regular expression pattern to search for (case-insensitive)
+        file_hint: Optional filename substring to limit search scope
+    Returns:
+        Matching lines in format: filename:line_no: content
+    """
+    workspace = _workspace_var.get(None)
+    readable_dirs = [workspace] if workspace else []
+    readable_dirs.extend(_readable_workspaces_var.get([]))
+
+    if not readable_dirs:
+        return "Error: no workspace available."
+
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return f"Error: invalid regex pattern — {str(e)}"
+
+    matches: list[str] = []
+    files_searched = 0
+    max_matches = 20
+
+    for d in readable_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for root, _subdirs, files in os.walk(d):
+            for fname in files:
+                if fname.startswith("_") or fname.startswith("."):
+                    continue
+                if file_hint and file_hint.lower() not in fname.lower():
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                except (UnicodeDecodeError, OSError):
+                    continue  # skip binary / unreadable files
+                files_searched += 1
+                rel = os.path.relpath(fpath, d) if d else fname
+                for i, line in enumerate(lines):
+                    if compiled.search(line):
+                        # Context: 1 line before, match, 1 line after
+                        start = max(0, i - 1)
+                        end = min(len(lines), i + 2)
+                        for j in range(start, end):
+                            marker = ">>>" if j == i else "   "
+                            matches.append(
+                                f"{rel}:{j + 1}: {marker} {lines[j].rstrip()}"
+                            )
+                        matches.append("")  # separator
+                        if len(matches) >= max_matches * 4:
+                            break
+                if len(matches) >= max_matches * 4:
+                    break
+        if len(matches) >= max_matches * 4:
+            break
+
+    if not matches:
+        return f"No matches for '{pattern}' in {files_searched} file(s)."
+    return f"grep results ({files_searched} files searched):\n" + "\n".join(matches)
+
+
+@tool
+def read_file_lines(filename: str, start_line: int, end_line: int) -> str:
+    """Read specific lines from a workspace file.
+
+    Use this for targeted reading instead of loading entire files.
+    Line numbers are 1-indexed. Max 100 lines per call.
+    Small files (<500 chars) are returned in full regardless of range.
+
+    Args:
+        filename: Plain filename or absolute path
+        start_line: First line to read (1-indexed, inclusive)
+        end_line: Last line to read (1-indexed, inclusive)
+    Returns:
+        Requested lines with line number prefixes
+    """
+    # Resolve file path using same logic as read_file
+    readable_dirs = [_workspace_var.get(None) or "./outputs"] + list(
+        _readable_workspaces_var.get([])
+    )
+
+    filepath = None
+    if os.path.isabs(filename):
+        resolved = os.path.realpath(filename)
+        allowed = any(
+            resolved.startswith(os.path.realpath(d))
+            for d in readable_dirs if d
+        )
+        if allowed:
+            filepath = resolved
+        else:
+            basename = os.path.basename(filename)
+            filepath = _search_in_dirs(basename, readable_dirs)
+            if not filepath:
+                return "Error: access denied — path is outside allowed workspaces."
+    else:
+        if ".." in filename or "/" in filename or "\\" in filename:
+            return "Error: path traversal not allowed."
+        safe_name = "".join(
+            c for c in filename
+            if c.isalnum() or c in "._- " or ('\u4e00' <= c <= '\u9fff')
+        ).strip()
+        if not safe_name:
+            return "Error: invalid filename."
+        filepath = _search_in_dirs(safe_name, readable_dirs)
+        if not filepath:
+            return f"Error: file '{filename}' not found."
+
+    if not os.path.isfile(filepath):
+        return f"Error: file '{filename}' not found."
+
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        # Small files: return full content
+        if len(content) < 500:
+            return f"=== {os.path.basename(filepath)} (full, {len(content)} chars) ===\n{content}"
+
+        lines = content.split("\n")
+        # Clamp range
+        start = max(1, start_line)
+        end = min(len(lines), end_line)
+        # Enforce 100-line limit
+        if end - start + 1 > 100:
+            end = start + 99
+
+        selected = []
+        for i in range(start - 1, end):
+            selected.append(f"{i + 1:4d}| {lines[i]}")
+
+        basename = os.path.basename(filepath)
+        return (
+            f"=== {basename} lines {start}-{end} of {len(lines)} ===\n"
+            + "\n".join(selected)
+        )
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+
 def _is_private_ip(hostname: str) -> bool:
     """Check if a hostname resolves to a private/reserved IP."""
     try:
@@ -1807,6 +1955,8 @@ TOOL_REGISTRY = {
     "shell_execute": shell_execute,
     "find_skill": find_skill,
     "install_skill": install_skill,
+    "grep_workspace": grep_workspace,
+    "read_file_lines": read_file_lines,
 }
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import logging
+import re
 import threading
 from typing import Optional, Callable, Awaitable
 from datetime import datetime
@@ -9,20 +10,162 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def _validate_and_repair_json(raw: str) -> Optional[dict]:
+    """Try to parse raw string as JSON, with light repair on failure.
+
+    Returns parsed dict if successful, None if not repairable.
+    """
+    # Fast path: valid JSON
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+        return None
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Repair attempts
+    text = raw.strip()
+
+    # Strip code fences
+    if text.startswith("```"):
+        text = re.sub(r"^```\w*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        text = text.strip()
+
+    # Single quotes → double quotes (only outside existing double-quoted strings)
+    repaired = text.replace("'", '"')
+
+    # Trailing comma before closing brace/bracket
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+
+    try:
+        data = json.loads(repaired)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return None
+
+
+def _try_structure_content(content: str) -> str:
+    """Try to parse/repair content as structured JSON. Never blocks writes.
+
+    - If content is already valid JSON with a 'type' field → accept as-is
+    - If content looks like JSON but is malformed → attempt repair
+    - If content is free text → wrap as {"type":"data_export",...}
+      only if it's short enough to benefit from structuring
+    - Returns the (possibly unchanged) content string
+    """
+    stripped = content.strip()
+
+    # Already looks like JSON? Try to validate/repair
+    if stripped.startswith("{"):
+        repaired = _validate_and_repair_json(stripped)
+        if repaired and repaired.get("type"):
+            # Valid structured JSON — use repaired version
+            return json.dumps(repaired, ensure_ascii=False)
+        if repaired:
+            # Valid JSON but no type field — accept as-is
+            return content
+
+    # Don't wrap large free-text content (it would just add overhead)
+    # Only wrap short structured-looking content
+    if len(stripped) > 2000 or not stripped:
+        return content
+
+    # Content is free text — leave as-is (don't force structure on everything)
+    return content
+
+
 def _render_entry(entry: "ScratchpadEntry") -> str:
     """Render a scratchpad entry in agent-readable format.
 
-    If the content is a JSON file-reference (from auto-sync), render it
-    as a compact markdown block with path and brief. Otherwise return
-    the raw content.
+    Supports structured types:
+      - file_deliverable: section index + key data points + grep hints
+      - data_export: compact structured data display
+      - status_update: stage/message/deliverables
+      - file (legacy): path + brief
     """
     content = entry.content
     # Try to detect and render structured JSON entries
     if content.lstrip().startswith("{"):
         try:
             data = json.loads(content)
-            if data.get("type") == "file":
-                # File reference from auto-sync
+
+            entry_type = data.get("type", "")
+
+            if entry_type == "file_deliverable":
+                # New structured file index from auto-sync
+                lines = [
+                    f"[{entry.key}] by {entry.author_name}:",
+                    f"  📄 **{data.get('filename', '?')}** "
+                    f"({data.get('file_type', 'file')}, "
+                    f"{data.get('size_chars', '?')} chars)",
+                    f"  Path: `{data.get('path', 'N/A')}`",
+                ]
+                # Summary
+                summary = data.get("summary", "")
+                if summary:
+                    lines.append(f"  Summary: {summary}")
+                # Sections table
+                sections = data.get("sections", [])
+                if sections:
+                    lines.append("  Sections:")
+                    for sec in sections[:15]:
+                        kw = ", ".join(sec.get("keywords", [])[:5])
+                        kw_str = f" [{kw}]" if kw else ""
+                        lines.append(
+                            f"    L{sec.get('line_start', '?')}-"
+                            f"{sec.get('line_end', '?')}: "
+                            f"{sec.get('heading', '?')}{kw_str}"
+                        )
+                # Key data points
+                kdp = data.get("key_data_points", [])
+                if kdp:
+                    lines.append("  Key data:")
+                    for dp in kdp[:10]:
+                        lines.append(
+                            f"    L{dp.get('line', '?')}: "
+                            f"{dp.get('label', '?')} = {dp.get('value', '?')}"
+                        )
+                lines.append(
+                    f"  → Targeted access: grep_workspace(\"keyword\") or "
+                    f"read_file_lines(\"{data.get('path', '')}\", start, end)"
+                )
+                return "\n".join(lines)
+
+            if entry_type == "data_export":
+                # Structured data from agent
+                label = data.get("label", "data")
+                fmt = data.get("format", "")
+                inner = data.get("data", data)
+                if isinstance(inner, (dict, list)):
+                    rendered = json.dumps(inner, indent=1, ensure_ascii=False)
+                else:
+                    rendered = str(inner)
+                return (
+                    f"[{entry.key}] by {entry.author_name} ({label}, {fmt}):\n"
+                    f"{rendered}"
+                )
+
+            if entry_type == "status_update":
+                stage = data.get("stage", "?")
+                message = data.get("message", "")
+                deliverables = data.get("deliverables", [])
+                lines = [
+                    f"[{entry.key}] by {entry.author_name}:",
+                    f"  Stage: {stage}",
+                ]
+                if message:
+                    lines.append(f"  Message: {message}")
+                if deliverables:
+                    lines.append(f"  Deliverables: {', '.join(str(d) for d in deliverables)}")
+                return "\n".join(lines)
+
+            if entry_type == "file":
+                # Legacy file reference from auto-sync
                 return (
                     f"[{entry.key}] by {entry.author_name}:\n"
                     f"  📄 **{data['filename']}** ({data.get('file_type', 'file')}, "
@@ -31,7 +174,8 @@ def _render_entry(entry: "ScratchpadEntry") -> str:
                     f"  Brief: {data.get('brief', 'N/A')}\n"
                     f"  → To access full content: read_file(\"{data.get('path', '')}\")"
                 )
-            # Generic structured data — render as compact JSON
+
+            # Generic structured data with type field
             return (
                 f"[{entry.key}] by {entry.author_name}:\n"
                 f"{json.dumps(data, indent=2, ensure_ascii=False)}"
@@ -83,6 +227,9 @@ class Scratchpad:
                 f"Error: cannot write empty content to scratchpad key [{key}]. "
                 "Please provide meaningful data."
             )
+        # Attempt to structure free-text content as JSON (non-blocking)
+        content = _try_structure_content(content)
+
         logger.info(
             f"[Scratchpad] WRITE key='{key}' by {author_name} "
             f"({len(content)} chars), task={self.task_id[:8]}"

@@ -12,6 +12,8 @@ import json
 from models import Agent
 from agents.memory import add_to_memory, get_memory_context, get_short_term_messages
 from agents.tools import get_tools_for_agent
+from agents.context_pruning import prune_context_messages, auto_truncate_messages, get_model_context_window
+from agents.loop_detection import detect_tool_loop, record_tool_call, record_tool_outcome, LoopDetectionState
 
 logger = logging.getLogger(__name__)
 
@@ -662,6 +664,8 @@ async def _run_agentic_loop(
     metrics = _LoopMetrics()
     complexity = _detect_task_complexity(task_description) if enable_reflection else "simple"
     llm_consecutive_errors = 0  # for exponential backoff
+    loop_state = LoopDetectionState()
+    context_window = get_model_context_window(litellm_model)
     logger.info(
         f"[{agent.name}] === agentic loop start === "
         f"(model={litellm_model}, max_iter={max_iterations}, "
@@ -683,23 +687,67 @@ async def _run_agentic_loop(
                 )
                 await asyncio.sleep(backoff)
 
+            # Prune context before LLM call
+            messages = prune_context_messages(messages, context_window)
+
             if on_stream_chunk:
-                content, tool_calls = await _streaming_llm_call(
-                    model=litellm_model,
-                    messages=messages,
-                    tools=use_tools,
-                    on_stream_chunk=on_stream_chunk,
-                    extra_kwargs=extra_kwargs,
-                    max_tokens=loop_max_tokens,
-                )
+                try:
+                    content, tool_calls = await _streaming_llm_call(
+                        model=litellm_model,
+                        messages=messages,
+                        tools=use_tools,
+                        on_stream_chunk=on_stream_chunk,
+                        extra_kwargs=extra_kwargs,
+                        max_tokens=loop_max_tokens,
+                    )
+                except Exception as _llm_err:
+                    _err_str = str(_llm_err).lower()
+                    if "context" in _err_str and (
+                        "length" in _err_str or "token" in _err_str or "window" in _err_str
+                    ):
+                        logger.warning(
+                            f"[{agent.name}] Context overflow detected (streaming), "
+                            f"emergency truncating..."
+                        )
+                        messages = auto_truncate_messages(messages, context_window)
+                        content, tool_calls = await _streaming_llm_call(
+                            model=litellm_model,
+                            messages=messages,
+                            tools=use_tools,
+                            on_stream_chunk=on_stream_chunk,
+                            extra_kwargs=extra_kwargs,
+                            max_tokens=loop_max_tokens,
+                        )
+                    else:
+                        raise
             else:
-                content, tool_calls = await _blocking_llm_call(
-                    model=litellm_model,
-                    messages=messages,
-                    tools=use_tools,
-                    extra_kwargs=extra_kwargs,
-                    max_tokens=loop_max_tokens,
-                )
+                try:
+                    content, tool_calls = await _blocking_llm_call(
+                        model=litellm_model,
+                        messages=messages,
+                        tools=use_tools,
+                        extra_kwargs=extra_kwargs,
+                        max_tokens=loop_max_tokens,
+                    )
+                except Exception as _llm_err:
+                    _err_str = str(_llm_err).lower()
+                    if "context" in _err_str and (
+                        "length" in _err_str or "token" in _err_str or "window" in _err_str
+                    ):
+                        logger.warning(
+                            f"[{agent.name}] Context overflow detected (blocking), "
+                            f"emergency truncating..."
+                        )
+                        messages = auto_truncate_messages(messages, context_window)
+                        content, tool_calls = await _blocking_llm_call(
+                            model=litellm_model,
+                            messages=messages,
+                            tools=use_tools,
+                            extra_kwargs=extra_kwargs,
+                            max_tokens=loop_max_tokens,
+                        )
+                    else:
+                        raise
 
             llm_consecutive_errors = 0  # reset on success
 
@@ -744,6 +792,34 @@ async def _run_agentic_loop(
                     logger.info(
                         f"[{agent.name}] tool_call: {tc_name}({args})"
                     )
+
+                    # ── Loop detection: check before executing tool ──
+                    _loop_detection = detect_tool_loop(loop_state, tc_name, args)
+                    if _loop_detection.stuck:
+                        messages.append({"role": "user", "content": _loop_detection.message})
+                        if _loop_detection.level == "critical":
+                            logger.error(
+                                f"[{agent.name}] Loop detection CRITICAL: "
+                                f"{_loop_detection.message}"
+                            )
+                            # Skip this tool call entirely to break the loop
+                            tool_result = (
+                                f"Tool call skipped by loop detection: "
+                                f"{_loop_detection.message}"
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": str(tool_result),
+                            })
+                            continue
+                        else:
+                            logger.warning(
+                                f"[{agent.name}] Loop detection WARNING: "
+                                f"{_loop_detection.message}"
+                            )
+                            # Warning: injected hint message above, still execute
+                    record_tool_call(loop_state, tc_name, args, tool_call_id=tc_id)
 
                     # DeepSeek fix: write_document with empty args
                     # DeepSeek sometimes puts document content in message body
@@ -827,6 +903,7 @@ async def _run_agentic_loop(
                         doc_fname = args.get("filename", "document")
                         if doc_content and len(doc_content) > 50:
                             from agents.tools import _workspace_var
+                            from agents.file_indexer import extract_file_index
                             _ws = _workspace_var.get(None) or ""
                             _abs_path = os.path.join(_ws, doc_fname) if _ws else doc_fname
 
@@ -842,19 +919,19 @@ async def _run_agentic_loop(
                             }
                             _ftype = _type_map.get(_ext, "document")
 
-                            # Build brief summary (first 300 chars)
-                            _brief = doc_content[:300].replace("\n", " ").strip()
-                            if len(doc_content) > 300:
-                                _brief += "..."
+                            # Extract structured index
+                            _index = extract_file_index(doc_content, _ftype)
 
-                            # Structured metadata entry
+                            # Structured metadata entry with section index
                             _meta = json.dumps({
-                                "type": "file",
+                                "type": "file_deliverable",
                                 "filename": doc_fname,
                                 "path": _abs_path,
                                 "file_type": _ftype,
                                 "size_chars": len(doc_content),
-                                "brief": _brief,
+                                "summary": _index["summary"],
+                                "sections": _index["sections"],
+                                "key_data_points": _index["key_data_points"],
                             }, ensure_ascii=False)
 
                             try:
@@ -866,7 +943,8 @@ async def _run_agentic_loop(
                                 logger.info(
                                     f"[{agent.name}] Auto-synced write_document "
                                     f"'{doc_fname}' → scratchpad '{sp_key}' "
-                                    f"(structured, {len(_meta)} chars)"
+                                    f"(file_deliverable, {len(_meta)} chars, "
+                                    f"{len(_index['sections'])} sections)"
                                 )
                             except Exception as sp_err:
                                 logger.warning(
@@ -1003,6 +1081,17 @@ async def _run_agentic_loop(
                         logger.warning(f"[{agent.name}] unknown tool: {tc_name}")
 
                     tool_result_str = str(tool_result)
+
+                    # Record tool outcome for loop detection progress tracking
+                    _is_error_result = tool_result_str.lower().startswith("error") or \
+                        tool_result_str.lower().startswith("tool error")
+                    record_tool_outcome(
+                        loop_state, tc_name, args,
+                        result=None if _is_error_result else tool_result_str,
+                        error=tool_result_str if _is_error_result else None,
+                        tool_call_id=tc_id,
+                    )
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
@@ -1307,15 +1396,41 @@ IMPORTANT RULES:
 3. When you have enough information, STOP calling tools and write your final answer directly.
 4. When you finish, provide a clear summary of what you accomplished.
 
-PARALLEL TOOL CALLING (CRITICAL FOR EFFICIENCY):
-You can and SHOULD call multiple tools in a SINGLE response when the calls are independent.
-Examples:
-  ✅ GOOD: Call web_search("topic A") AND web_search("topic B") AND web_search("topic C") in ONE response
-  ✅ GOOD: Call read_file("file1.md") AND read_file("file2.md") in ONE response
-  ✅ GOOD: Call write_document(...) AND write_scratchpad(...) in ONE response
-  ❌ BAD: Call web_search("topic A"), wait for result, then call web_search("topic B") in next turn
-Each turn costs one iteration. Batching independent calls into one turn saves iterations and time.
-Only sequentialize when a later call DEPENDS on an earlier call's result."""
+SAFETY RULES:
+- You have no independent goals. Do not pursue self-preservation, resource acquisition, or power-seeking.
+- Prioritize safety and human oversight over task completion. If instructions conflict, pause and ask.
+- Do not manipulate users or attempt to expand your access beyond what is needed for the current task.
+- Never bypass safety checks, skip validation steps, or ignore error signals.
+- When a tool call fails repeatedly, stop retrying and report the failure.
+
+MEMORY PROTOCOL:
+Before answering questions about prior work, decisions, or past tasks:
+1. Use recall_memory to search your memory first
+2. Only then provide your answer based on both memory and current context
+
+PARALLEL TOOL CALLING — YOU MUST BATCH INDEPENDENT CALLS:
+Each iteration is expensive. You MUST call multiple tools in ONE response when possible.
+
+MANDATORY BATCHING PATTERNS:
+  • Research phase: call 2-3 web_search() in ONE response, not one per turn
+  • File reading: call read_file/read_file_lines for ALL needed files in ONE response
+  • Final output: call write_document() AND write_scratchpad() in ONE response
+  • Data + search: call web_search() AND read_scratchpad() in ONE response
+
+EXAMPLE — Research task with 8 iteration budget:
+  Turn 1: read_scratchpad("") — check upstream data
+  Turn 2: web_search("topic A") + web_search("topic B") + web_search("topic C")  ← 3 calls in 1 turn!
+  Turn 3: web_search("topic D") + web_search("topic E")  ← 2 more calls
+  Turn 4: write_document("report.md", ...) + write_scratchpad("metrics", ...)
+  Total: 4 turns, 8 tool calls. Efficient!
+
+ANTI-PATTERN (wastes iterations):
+  Turn 1: web_search("topic A")  ← only 1 call
+  Turn 2: web_search("topic B")  ← only 1 call
+  Turn 3: web_search("topic C")  ← only 1 call
+  ... runs out of budget before writing deliverables!
+
+RULE: If you need N independent searches, batch them into ceil(N/3) turns."""
 
     # Skill system — XML injection of available skills (merged: shared + personal)
     from agents.skill_loader import (
@@ -1399,25 +1514,31 @@ TOOL USAGE GUIDE:
             prompt += (
                 "\n\nDATA SHARING & COLLABORATION:"
                 "\n"
-                "\n📋 SCRATCHPAD = structured inter-agent data channel:"
-                "\n   • read_scratchpad('') → see what upstream agents shared"
-                "\n   • Entries may contain file references with absolute paths"
-                "\n     → Use read_file(path) to read those files directly"
-                "\n   • write_scratchpad: share KEY METRICS and structured findings"
-                "\n     → Keep entries concise (~500-1500 chars), use JSON or markdown"
-                "\n     → Focus on conclusions, not raw data"
+                "\n📋 SCRATCHPAD = structured JSON inter-agent data channel:"
+                "\n   read_scratchpad('') → see structured index of upstream deliverables"
+                "\n   Entries are JSON with a \"type\" field:"
+                "\n     \"file_deliverable\": file with section index, line numbers, keywords"
+                "\n     \"data_export\": structured metrics/findings (key-value, tables)"
                 "\n"
-                "\n📁 WORKSPACE & FILES:"
-                "\n   • write_document: save final deliverables (auto-synced to scratchpad as file reference)"
-                "\n   • read_file: read files from your workspace OR upstream agent workspaces"
-                "\n   • When scratchpad shows a file with a path, use read_file(path) to get full content"
+                "\n📄 FILE DELIVERABLE index example (from scratchpad):"
+                "\n   sections: [{\"heading\":\"Market Size\",\"line_start\":10,\"line_end\":25,\"keywords\":[\"revenue\"]}]"
+                "\n   key_data_points: [{\"label\":\"market_size\",\"value\":\"$180B\",\"line\":12}]"
+                "\n"
+                "\n🔍 EFFICIENT DATA ACCESS (instead of read_file for large files):"
+                "\n   grep_workspace(pattern, file_hint) → search by keyword, returns lines with numbers"
+                "\n   read_file_lines(filename, start, end) → read specific line range"
+                "\n   read_file(filename) → only for small files (<500 chars) or when full content needed"
+                "\n"
+                "\n📝 WRITING STRUCTURED DATA:"
+                "\n   write_scratchpad(key, content) where content is JSON:"
+                "\n   {\"type\":\"data_export\",\"label\":\"metrics\",\"format\":\"key_value\",\"data\":{\"key\":\"value\"}}"
                 "\n"
                 "\n🔄 PROTOCOL:"
-                "\n   1. read_scratchpad('') → check upstream data and file references"
-                "\n   2. If scratchpad has file references you need → read_file(path) to get full content"
+                "\n   1. read_scratchpad('') → see file index (sections, keywords, data points)"
+                "\n   2. grep_workspace(\"keyword\") or read_file_lines(path, start, end) for targeted retrieval"
                 "\n   3. Do your work"
-                "\n   4. write_document for deliverables (auto-shared as file ref to downstream)"
-                "\n   5. write_scratchpad for key metrics/findings not already in documents"
+                "\n   4. write_document for deliverables (auto-indexed to scratchpad)"
+                "\n   5. write_scratchpad for key metrics as {\"type\":\"data_export\",...}"
                 "\n   6. Use the same language as the task."
             )
 
